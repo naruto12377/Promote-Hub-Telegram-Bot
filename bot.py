@@ -1100,9 +1100,8 @@ async def on_startup(app: Application):
     logger.info("✅ PromoteHub is ready!")
 
 
-def main():
-    start_keep_alive()
-
+def _build_app() -> Application:
+    """Build and return the configured Application object."""
     app = (
         Application.builder()
         .token(BOT_TOKEN)
@@ -1131,9 +1130,46 @@ def main():
         handle_message,
     ))
 
+    return app
+
+
+async def async_main() -> None:
+    """
+    Async entry point — compatible with Python 3.10+ (including 3.14).
+    Runs the keep-alive HTTP server in a daemon thread and the bot
+    inside a proper asyncio event loop managed by asyncio.run().
+    """
+    start_keep_alive()
+    app = _build_app()
+
     logger.info("Starting polling…")
-    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
+
+    # Use the low-level async API so we stay inside asyncio.run()'s loop
+    async with app:
+        await app.start()
+        await app.updater.start_polling(
+            allowed_updates=Update.ALL_TYPES,
+            drop_pending_updates=True,
+        )
+        # Keep running until a signal (SIGINT / SIGTERM) is received
+        stop_event = asyncio.Event()
+
+        def _request_stop(*_):
+            stop_event.set()
+
+        import signal
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            try:
+                asyncio.get_event_loop().add_signal_handler(sig, _request_stop)
+            except (ValueError, NotImplementedError):
+                # Windows / certain environments don't support add_signal_handler
+                pass
+
+        await stop_event.wait()
+        logger.info("Shutdown signal received — stopping…")
+        await app.updater.stop()
+        await app.stop()
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(async_main())
