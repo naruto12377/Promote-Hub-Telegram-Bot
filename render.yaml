@@ -1,0 +1,35 @@
+services:
+  - type: web
+    name: promotehub-bot
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: BOT_USERNAME
+        sync: false
+      - key: PROMOTION_CHANNEL_ID
+        sync: false
+      - key: PROMOTION_CHANNEL_LINK
+        sync: false
+      - key: GROUP_ID
+        sync: false
+      - key: GROUP_LINK
+        sync: false
+      - key: DATABASE_CHANNEL_ID
+        sync: false
+      - key: ADMIN_IDS
+        sync: false
+      - key: POSTS_PER_HOUR
+        value: "2"
+      - key: MAX_WARNINGS
+        value: "3"
+      - key: POST_ALLOWED_IN
+        value: "dm"
+      - key: BAD_WORDS
+        value: "spam,scam,fake,adult,xxx,porn,crypto scam,ponzi,betting,gambling"
+      - key: BAD_LINKS
+        value: "onlyfans.com,bit.ly/adult"
+      - key: PORT
+        value: "8080"
