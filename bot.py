@@ -1485,72 +1485,95 @@ async def main() -> None:
     global _app
     _app = build_app()
 
-    if WEBHOOK_URL:
-        # ══════════════════════════════════════════════════════════════════════
-        # WEBHOOK MODE  — Render / any public HTTPS host
-        #
-        # CRITICAL ORDER:
-        #   1. Bind HTTP port FIRST  ← Render scans for an open port immediately
-        #   2. Then initialise Telegram (db_load, set_webhook, etc.)
-        #
-        # If we call Telegram API before the port is open, Render times out
-        # ("No open ports detected") and kills the process.
-        # ══════════════════════════════════════════════════════════════════════
+    # ══════════════════════════════════════════════════════════════════════════
+    # STEP 1 — Bind the HTTP port IMMEDIATELY (before ANY Telegram API calls)
+    #
+    # Render scans for an open port right after the process starts.
+    # If we do ANY network I/O first (Telegram API, db_load, set_webhook…)
+    # Render may time out and print "No open ports detected" → deploy fails.
+    #
+    # The HTTP server serves:
+    #   GET  /        → health check (Render uptime monitor)
+    #   GET  /health  → health check
+    #   POST /{TOKEN} → Telegram webhook updates
+    # ══════════════════════════════════════════════════════════════════════════
+    web_application = make_web_app()
+    runner = web.AppRunner(web_application)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", PORT)
+    await site.start()
+    log.info(f"✅ HTTP server bound to 0.0.0.0:{PORT}  ← Render detects this immediately")
 
-        # ── Step 1: open the port immediately ────────────────────────────────
-        web_application = make_web_app()
-        runner = web.AppRunner(web_application)
-        await runner.setup()
-        site = web.TCPSite(runner, "0.0.0.0", PORT)
-        await site.start()
-        log.info(f"✅ HTTP server bound to port {PORT}  ← Render will detect this")
+    # ══════════════════════════════════════════════════════════════════════════
+    # STEP 2 — Start the Telegram application (db_load, set_my_commands, etc.)
+    # ══════════════════════════════════════════════════════════════════════════
+    async with _app:
+        await _app.start()  # triggers on_startup → db_load, set_my_commands
 
-        # ── Step 2: initialise the Telegram application ───────────────────────
-        async with _app:
-            await _app.start()   # triggers on_startup → db_load, set_my_commands
-
+        if WEBHOOK_URL:
+            # ── WEBHOOK MODE (Render / any public HTTPS host) ─────────────────
             webhook_full_url = f"{WEBHOOK_URL.rstrip('/')}/{BOT_TOKEN}"
+
+            # Delete any stale webhook from a previous deploy/instance first
+            try:
+                await _app.bot.delete_webhook(drop_pending_updates=True)
+                log.info("Cleared any previous webhook.")
+            except TelegramError as e:
+                log.warning(f"Could not clear old webhook (non-fatal): {e}")
+
             await _app.bot.set_webhook(
                 url=webhook_full_url,
                 allowed_updates=Update.ALL_TYPES,
                 drop_pending_updates=True,
             )
-            log.info(f"✅ Webhook registered: {webhook_full_url}")
+            log.info(f"✅ Webhook set → {webhook_full_url}")
+            log.info("Bot is LIVE via webhook. Waiting for updates…")
 
-            # ── Run until interrupted ─────────────────────────────────────────
             try:
-                await asyncio.Event().wait()
+                await asyncio.Event().wait()  # run forever
             except (KeyboardInterrupt, SystemExit):
                 log.info("Shutdown signal received.")
             finally:
-                log.info("Shutting down…")
+                log.info("Shutting down webhook bot…")
                 try:
                     await _app.bot.delete_webhook()
                 except TelegramError:
                     pass
-                await _app.stop()
 
-        await runner.cleanup()
+        else:
+            # ── POLLING MODE (local dev — WEBHOOK_URL not set) ────────────────
+            #
+            # Even in polling mode we keep the HTTP server running so Render
+            # never complains about "no open ports". The /health endpoint
+            # answers normally; the webhook route just won't receive anything.
+            #
+            # Before polling we MUST delete any registered webhook, otherwise
+            # Telegram returns 409 Conflict on every getUpdates call.
+            log.info("WEBHOOK_URL not set — starting polling mode.")
+            try:
+                await _app.bot.delete_webhook(drop_pending_updates=True)
+                log.info("Cleared any registered webhook (required before polling).")
+            except TelegramError as e:
+                log.warning(f"Could not clear webhook (non-fatal): {e}")
 
-    else:
-        # ══════════════════════════════════════════════════════════════════════
-        # POLLING MODE  — local development (no WEBHOOK_URL set)
-        # ══════════════════════════════════════════════════════════════════════
-        log.info("No WEBHOOK_URL set — using long-polling (dev mode).")
-        async with _app:
-            await _app.start()
             await _app.updater.start_polling(
                 allowed_updates=Update.ALL_TYPES,
                 drop_pending_updates=True,
             )
-            log.info("Bot is polling. Press Ctrl+C to stop.")
+            log.info("✅ Bot is polling. HTTP health server still running on port {PORT}.")
+
             try:
-                await asyncio.Event().wait()
+                await asyncio.Event().wait()  # run forever
             except (KeyboardInterrupt, SystemExit):
-                pass
+                log.info("Shutdown signal received.")
             finally:
+                log.info("Shutting down polling bot…")
                 await _app.updater.stop()
-                await _app.stop()
+
+        await _app.stop()
+
+    await runner.cleanup()
+    log.info("Goodbye.")
 
 
 if __name__ == "__main__":
