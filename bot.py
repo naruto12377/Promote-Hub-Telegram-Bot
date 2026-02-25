@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 PromoteHub — Telegram Promotion Marketplace Bot
 ================================================
@@ -6,8 +5,12 @@ PromoteHub — Telegram Promotion Marketplace Bot
 - html.escape() on ALL user-provided content
 - Global error handler catches everything
 - Clean 3-step post flow: content → type → preview → publish
-- Telegram channel as database (JSON pinned message)
-- Render free tier compatible (asyncio.run + keep-alive HTTP)
+- Telegram channel as database (JSON message, searched on restart)
+- Render free tier compatible (webhook + keep-alive HTTP)
+- Group posting support with session isolation
+- "Posted by: @username" in posts
+- Extended category types
+- Hashtag tips and 4-hashtag limit
 """
 
 import asyncio
@@ -31,7 +34,7 @@ from telegram import (
     Update,
 )
 from telegram.constants import ChatMemberStatus, ChatType
-from telegram.error import BadRequest, Forbidden, NetworkError, TelegramError
+from telegram.error import BadRequest, Forbidden, NetworkError, TelegramError, TimedOut
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -52,7 +55,7 @@ logging.basicConfig(
 log = logging.getLogger("PromoteHub")
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# CONFIG  — purely from environment variables
+# CONFIG — purely from environment variables
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _req(key: str) -> str:
@@ -95,8 +98,12 @@ POST_ALLOWED_IN = os.getenv("POST_ALLOWED_IN", "dm").strip().lower()
 if POST_ALLOWED_IN not in ("dm", "group", "both"):
     POST_ALLOWED_IN = "dm"
 
+# WEBHOOK_URL: if set, bot uses webhooks instead of polling
+# Example: https://your-app.onrender.com
+WEBHOOK_URL = os.getenv("WEBHOOK_URL", "").strip()
+
 # ═══════════════════════════════════════════════════════════════════════════════
-# IN-MEMORY STATE  (persisted to DB_CHANNEL after every mutation)
+# IN-MEMORY STATE (persisted to DB_CHANNEL after every mutation)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 db: dict = {
@@ -107,89 +114,196 @@ db: dict = {
     "referrals":  0,
     "links":      0,
     "others":     0,
-    "banned":     [],   # list[int]
-    "warnings":   {},   # {str(user_id): int}
+    "gaming":     0,
+    "crypto":     0,
+    "business":   0,
+    "chatting":   0,
+    "anime":      0,
+    "study":      0,
+    "earning":    0,
+    "banned":     [],
+    "warnings":   {},
 }
 _db_msg_id: Optional[int] = None
 
-# Per-user post timestamps for rate-limiting (not persisted — resets on restart, fine)
+# Per-user post timestamps for rate-limiting
 _rate: dict = defaultdict(list)
 
-# Active submission sessions: {user_id: {"step": str, "content": str, "ptype": str}}
+# Active submission sessions: {user_id: {"step": str, "content": str, "ptype": str, "username": str}}
 _sessions: dict = {}
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# PERSISTENCE  — Telegram channel as database
+# PERSISTENCE — Telegram channel as database
 # ═══════════════════════════════════════════════════════════════════════════════
 
+DB_TAG = "#PH_DB_V2"
+
 async def db_save(app: Application) -> None:
-    """Overwrite the pinned state message in the DB channel."""
+    """Save state to DB channel. Always try edit first, then send new if needed."""
     global _db_msg_id
-    payload = "#PH_DB\n" + json.dumps(db, ensure_ascii=False, separators=(",", ":"))
+    payload = DB_TAG + "\n" + json.dumps(db, ensure_ascii=False, separators=(",", ":"))
     try:
         if _db_msg_id:
-            await app.bot.edit_message_text(
-                chat_id=DB_CHANNEL_ID,
-                message_id=_db_msg_id,
-                text=payload,
-            )
-        else:
-            msg = await app.bot.send_message(chat_id=DB_CHANNEL_ID, text=payload)
-            _db_msg_id = msg.message_id
             try:
-                await app.bot.pin_chat_message(
+                await app.bot.edit_message_text(
                     chat_id=DB_CHANNEL_ID,
                     message_id=_db_msg_id,
-                    disable_notification=True,
+                    text=payload,
                 )
-            except TelegramError:
-                pass  # pin failure is non-critical
+                return
+            except BadRequest as e:
+                if "message is not modified" in str(e).lower():
+                    return
+                log.warning(f"db_save edit failed: {e}, will send new message")
+                _db_msg_id = None
+            except TelegramError as e:
+                log.warning(f"db_save edit failed: {e}, will send new message")
+                _db_msg_id = None
+
+        # Send new message
+        msg = await app.bot.send_message(chat_id=DB_CHANNEL_ID, text=payload)
+        _db_msg_id = msg.message_id
+        try:
+            await app.bot.pin_chat_message(
+                chat_id=DB_CHANNEL_ID,
+                message_id=_db_msg_id,
+                disable_notification=True,
+            )
+        except TelegramError:
+            pass
     except TelegramError as e:
-        log.error(f"db_save failed: {e}")
+        log.error(f"db_save failed completely: {e}")
 
 
 async def db_load(app: Application) -> None:
-    """Restore state from the pinned DB channel message on startup."""
+    """
+    Restore state from DB channel on startup.
+    Strategy:
+    1. Try pinned message first
+    2. If not found, search recent messages for DB_TAG
+    """
     global db, _db_msg_id
+
+    def _parse_db_text(text: str) -> Optional[dict]:
+        if text and DB_TAG in text:
+            try:
+                raw = text.split("\n", 1)[1]
+                return json.loads(raw)
+            except (IndexError, json.JSONDecodeError) as e:
+                log.warning(f"Failed to parse DB text: {e}")
+        # Also try old tag for backward compatibility
+        if text and text.startswith("#PH_DB"):
+            try:
+                raw = text.split("\n", 1)[1]
+                return json.loads(raw)
+            except (IndexError, json.JSONDecodeError):
+                pass
+        return None
+
     try:
+        # Strategy 1: Check pinned message
         chat = await app.bot.get_chat(DB_CHANNEL_ID)
-        pinned = chat.pinned_message
-        if pinned and pinned.text and pinned.text.startswith("#PH_DB"):
-            raw = pinned.text.split("\n", 1)[1]
-            loaded = json.loads(raw)
-            # Merge carefully — keep all keys even if new keys were added
-            for k, v in loaded.items():
-                db[k] = v
-            _db_msg_id = pinned.message_id
-            log.info(
-                f"State restored ✅  posts={db['post_count']}  "
-                f"banned={len(db['banned'])}"
+        if chat.pinned_message and chat.pinned_message.text:
+            loaded = _parse_db_text(chat.pinned_message.text)
+            if loaded:
+                for k, v in loaded.items():
+                    db[k] = v
+                _db_msg_id = chat.pinned_message.message_id
+                log.info(
+                    f"State restored from pinned message ✅ posts={db['post_count']} "
+                    f"banned={len(db['banned'])}"
+                )
+                return
+
+        # Strategy 2: Search recent messages (last 20)
+        log.info("Pinned message not found or invalid, searching recent messages...")
+        # We need to get recent messages from the channel
+        # Use getUpdates won't work for channels, so we try a different approach
+        # Send a temporary message and check messages before it
+        temp_msg = await app.bot.send_message(
+            chat_id=DB_CHANNEL_ID, text="#PH_SEARCH_TEMP"
+        )
+        temp_id = temp_msg.message_id
+
+        # Search backward from temp message
+        found = False
+        for offset in range(1, 50):
+            check_id = temp_id - offset
+            if check_id <= 0:
+                break
+            try:
+                # Try to forward the message to get its content
+                fwd = await app.bot.forward_message(
+                    chat_id=DB_CHANNEL_ID,
+                    from_chat_id=DB_CHANNEL_ID,
+                    message_id=check_id,
+                )
+                if fwd.text:
+                    loaded = _parse_db_text(fwd.text)
+                    if loaded:
+                        for k, v in loaded.items():
+                            db[k] = v
+                        _db_msg_id = check_id
+                        log.info(
+                            f"State restored from message {check_id} ✅ "
+                            f"posts={db['post_count']} banned={len(db['banned'])}"
+                        )
+                        found = True
+                        # Delete the forwarded copy
+                        try:
+                            await app.bot.delete_message(
+                                chat_id=DB_CHANNEL_ID, message_id=fwd.message_id
+                            )
+                        except TelegramError:
+                            pass
+                        break
+                    else:
+                        # Delete forwarded non-DB message
+                        try:
+                            await app.bot.delete_message(
+                                chat_id=DB_CHANNEL_ID, message_id=fwd.message_id
+                            )
+                        except TelegramError:
+                            pass
+            except TelegramError:
+                continue
+
+        # Clean up temp message
+        try:
+            await app.bot.delete_message(
+                chat_id=DB_CHANNEL_ID, message_id=temp_id
             )
-        else:
+        except TelegramError:
+            pass
+
+        if not found:
             log.info("No saved state found — starting fresh.")
     except Exception as e:
         log.error(f"db_load failed: {e}")
 
 
-async def db_log(app: Application, num: int, uid: int, ptype: str) -> None:
+async def db_log(app: Application, num: int, uid: int, uname: str, ptype: str) -> None:
     """Append a lightweight audit record to the DB channel."""
     try:
         await app.bot.send_message(
             chat_id=DB_CHANNEL_ID,
-            text=f"#POST id={num} user={uid} type={ptype.lower()} ts={int(time.time())}",
+            text=(
+                f"#POST id={num} user={uid} username=@{uname} "
+                f"type={ptype.lower()} ts={int(time.time())}"
+            ),
         )
     except TelegramError:
-        pass  # audit log failure is non-critical
+        pass
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # SMALL UTILITIES
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def is_banned(uid: int) -> bool:
-    return uid in db["banned"]
+    return uid in db.get("banned", [])
 
 def get_warns(uid: int) -> int:
-    return db["warnings"].get(str(uid), 0)
+    return db.get("warnings", {}).get(str(uid), 0)
 
 def is_admin(uid: int) -> bool:
     return uid in ADMIN_IDS
@@ -200,7 +314,7 @@ def has_bad_content(text: str) -> bool:
 
 def rate_ok(uid: int):
     """Returns (allowed: bool, seconds_to_wait: float)."""
-    now   = time.time()
+    now = time.time()
     clean = [t for t in _rate[uid] if now - t < 3600]
     _rate[uid] = clean
     if len(clean) >= POSTS_PER_HOUR:
@@ -230,13 +344,22 @@ def extract_tme_username(text: str) -> Optional[str]:
     if not m:
         return None
     username = m.group(1)
-    # Skip non-resolvable paths
     if username.lower() in ("joinchat", "share", "addstickers", "boost", "s"):
         return None
     return username
 
+def count_hashtags(text: str) -> int:
+    """Count hashtags in text."""
+    return len(re.findall(r"#\w+", text))
+
+def get_username_display(user) -> str:
+    """Get @username or first_name for display."""
+    if user.username:
+        return f"@{user.username}"
+    return user.first_name or "Anonymous"
+
 # ═══════════════════════════════════════════════════════════════════════════════
-# POST TYPES
+# POST TYPES — Extended categories
 # ═══════════════════════════════════════════════════════════════════════════════
 
 TYPE_EMOJI = {
@@ -245,23 +368,34 @@ TYPE_EMOJI = {
     "Service":  "🛠️",
     "Referral": "🔗",
     "Link":     "🌐",
+    "Gaming":   "🎮",
+    "Crypto":   "💰",
+    "Business": "💼",
+    "Chatting": "💬",
+    "Anime":    "🎌",
+    "Study":    "📚",
+    "Earning":  "💵",
     "Other":    "📋",
 }
+
 STAT_KEY = {
     "channel":  "channels",
     "group":    "groups",
     "service":  "services",
     "referral": "referrals",
     "link":     "links",
+    "gaming":   "gaming",
+    "crypto":   "crypto",
+    "business": "business",
+    "chatting": "chatting",
+    "anime":    "anime",
+    "study":    "study",
+    "earning":  "earning",
     "other":    "others",
 }
 
 async def detect_type(text: str, bot) -> Optional[str]:
-    """
-    Auto-detect post type.
-    Returns type string or None (user must choose manually).
-    """
-    # Invite links (t.me/+ or joinchat) → Group
+    """Auto-detect post type. Returns type string or None."""
     if re.search(r"t\.me/\+|t\.me/joinchat", text, re.IGNORECASE):
         return "Group"
 
@@ -275,14 +409,11 @@ async def detect_type(text: str, bot) -> Optional[str]:
                 return "Group"
         except TelegramError:
             pass
-        # t.me link but couldn't resolve → treat as Link
         return "Link"
 
-    # Other URLs → Link
     if re.search(r"https?://\S+", text):
         return "Link"
 
-    # Pure text → ask user
     return None
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -290,46 +421,65 @@ async def detect_type(text: str, bot) -> Optional[str]:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def kb_join() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📢 Join Channel", url=PROMO_CHANNEL_LINK)],
-        [InlineKeyboardButton("💬 Join Group",   url=GROUP_LINK)],
-        [InlineKeyboardButton("✅ I Joined — Verify", callback_data="check_join")],
-    ])
+    buttons = []
+    if PROMO_CHANNEL_LINK:
+        buttons.append([InlineKeyboardButton("📢 Join Channel", url=PROMO_CHANNEL_LINK)])
+    if GROUP_LINK:
+        buttons.append([InlineKeyboardButton("💬 Join Group", url=GROUP_LINK)])
+    buttons.append([InlineKeyboardButton("✅ I Joined — Verify", callback_data="check_join")])
+    return InlineKeyboardMarkup(buttons)
 
 def kb_home() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
+    buttons = [
         [InlineKeyboardButton("📝 Submit Promotion — FREE", callback_data="start_post")],
         [
-            InlineKeyboardButton("📊 Stats",       callback_data="stats"),
-            InlineKeyboardButton("❓ Help",         callback_data="help"),
+            InlineKeyboardButton("📊 Stats", callback_data="stats"),
+            InlineKeyboardButton("❓ Help", callback_data="help"),
         ],
-        [InlineKeyboardButton("📢 Browse Posts", url=PROMO_CHANNEL_LINK)],
-    ])
+    ]
+    if PROMO_CHANNEL_LINK:
+        buttons.append([InlineKeyboardButton("📢 Browse Posts", url=PROMO_CHANNEL_LINK)])
+    return InlineKeyboardMarkup(buttons)
 
 def kb_type() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [
             InlineKeyboardButton("📢 Channel",  callback_data="type:Channel"),
-            InlineKeyboardButton("👥 Group",    callback_data="type:Group"),
+            InlineKeyboardButton("👥 Group",     callback_data="type:Group"),
         ],
         [
             InlineKeyboardButton("🛠️ Service",  callback_data="type:Service"),
-            InlineKeyboardButton("🔗 Referral", callback_data="type:Referral"),
+            InlineKeyboardButton("🔗 Referral",  callback_data="type:Referral"),
         ],
         [
-            InlineKeyboardButton("🌐 Link",     callback_data="type:Link"),
-            InlineKeyboardButton("📋 Other",    callback_data="type:Other"),
+            InlineKeyboardButton("🎮 Gaming",    callback_data="type:Gaming"),
+            InlineKeyboardButton("💰 Crypto",    callback_data="type:Crypto"),
         ],
-        [InlineKeyboardButton("❌ Cancel",      callback_data="cancel")],
+        [
+            InlineKeyboardButton("💼 Business",  callback_data="type:Business"),
+            InlineKeyboardButton("💬 Chatting",  callback_data="type:Chatting"),
+        ],
+        [
+            InlineKeyboardButton("🎌 Anime",     callback_data="type:Anime"),
+            InlineKeyboardButton("📚 Study",     callback_data="type:Study"),
+        ],
+        [
+            InlineKeyboardButton("💵 Earning",   callback_data="type:Earning"),
+            InlineKeyboardButton("🌐 Link",      callback_data="type:Link"),
+        ],
+        [
+            InlineKeyboardButton("📋 Other",     callback_data="type:Other"),
+        ],
+        [InlineKeyboardButton("❌ Cancel", callback_data="cancel")],
     ])
 
 def kb_confirm() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [
             InlineKeyboardButton("✅ Publish Now", callback_data="publish"),
-            InlineKeyboardButton("✏️ Edit",        callback_data="edit"),
+            InlineKeyboardButton("✏️ Edit", callback_data="edit"),
         ],
-        [InlineKeyboardButton("❌ Cancel",         callback_data="cancel")],
+        [InlineKeyboardButton("❌ Cancel", callback_data="cancel")],
     ])
 
 def kb_back() -> InlineKeyboardMarkup:
@@ -338,13 +488,14 @@ def kb_back() -> InlineKeyboardMarkup:
     ])
 
 def kb_after_post() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📢 View Post",     url=PROMO_CHANNEL_LINK)],
-        [InlineKeyboardButton("📝 Post Another",  callback_data="start_post")],
-    ])
+    buttons = []
+    if PROMO_CHANNEL_LINK:
+        buttons.append([InlineKeyboardButton("📢 View Post", url=PROMO_CHANNEL_LINK)])
+    buttons.append([InlineKeyboardButton("📝 Post Another", callback_data="start_post")])
+    return InlineKeyboardMarkup(buttons)
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# MESSAGE TEMPLATES  — all HTML, user content always escaped
+# MESSAGE TEMPLATES — all HTML, user content always escaped
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def tpl_home(first_name: str) -> str:
@@ -359,16 +510,29 @@ def tpl_stats() -> str:
     return (
         f"📊 <b>PromoteHub Stats</b>\n\n"
         f"📌 Total Posts : <b>{db['post_count']}</b>\n"
-        f"📢 Channels   : <b>{db['channels']}</b>\n"
-        f"👥 Groups     : <b>{db['groups']}</b>\n"
-        f"🛠️ Services   : <b>{db['services']}</b>\n"
-        f"🔗 Referrals  : <b>{db['referrals']}</b>\n"
-        f"🌐 Links      : <b>{db['links']}</b>\n"
-        f"📋 Others     : <b>{db['others']}</b>\n\n"
+        f"{'─'*24}\n"
+        f"📢 Channels   : <b>{db.get('channels', 0)}</b>\n"
+        f"👥 Groups     : <b>{db.get('groups', 0)}</b>\n"
+        f"🛠️ Services   : <b>{db.get('services', 0)}</b>\n"
+        f"🔗 Referrals  : <b>{db.get('referrals', 0)}</b>\n"
+        f"🎮 Gaming     : <b>{db.get('gaming', 0)}</b>\n"
+        f"💰 Crypto     : <b>{db.get('crypto', 0)}</b>\n"
+        f"💼 Business   : <b>{db.get('business', 0)}</b>\n"
+        f"💬 Chatting   : <b>{db.get('chatting', 0)}</b>\n"
+        f"🎌 Anime      : <b>{db.get('anime', 0)}</b>\n"
+        f"📚 Study      : <b>{db.get('study', 0)}</b>\n"
+        f"💵 Earning    : <b>{db.get('earning', 0)}</b>\n"
+        f"🌐 Links      : <b>{db.get('links', 0)}</b>\n"
+        f"📋 Others     : <b>{db.get('others', 0)}</b>\n\n"
         f"🚀 Submit yours → {h(BOT_USERNAME)}"
     )
 
 def tpl_help() -> str:
+    where = "DM"
+    if POST_ALLOWED_IN == "group":
+        where = "our group"
+    elif POST_ALLOWED_IN == "both":
+        where = "DM or group"
     return (
         f"❓ <b>PromoteHub Help</b>\n\n"
         f"<b>Commands</b>\n"
@@ -379,40 +543,64 @@ def tpl_help() -> str:
         f"<b>What can I promote?</b>\n"
         f"✅ Telegram channels &amp; groups\n"
         f"✅ Services, bots, websites\n"
-        f"✅ Referral &amp; affiliate links\n\n"
+        f"✅ Referral &amp; affiliate links\n"
+        f"✅ Gaming, Crypto, Anime communities\n"
+        f"✅ Study groups, Earning platforms\n\n"
+        f"<b>Where to post?</b>\n"
+        f"📩 Post in: <b>{where}</b>\n\n"
         f"<b>Rules</b>\n"
         f"⏳ Max <b>{POSTS_PER_HOUR}</b> post(s) per hour\n"
         f"⚠️ <b>{MAX_WARNINGS}</b> violations = permanent ban\n"
-        f"🚫 No spam / adult / scam content\n\n"
-        f"📢 Browse posts → {PROMO_CHANNEL_LINK}"
+        f"🚫 No spam / adult / scam content\n"
+        f"#️⃣ Max <b>4 hashtags</b> per post\n\n"
+        f"<b>💡 Tip:</b> Add hashtags to your post for better\n"
+        f"search results and ranking!\n"
+        f"Example: #gaming #community #fun #telegram\n\n"
+        f"📢 Browse posts → {PROMO_CHANNEL_LINK or BOT_USERNAME}"
     )
 
-def tpl_post(num: int, ptype: str, content: str) -> str:
-    """Format a post for the promotion channel. Content is raw user text — no HTML escaping
-    here because we send this WITHOUT parse_mode to avoid any formatting errors."""
+def tpl_post(num: int, ptype: str, content: str, username_display: str) -> str:
+    """Format a post for the promotion channel.
+    Sent WITHOUT parse_mode — plain text, 100% safe."""
     emoji = TYPE_EMOJI.get(ptype, "📋")
-    divider = "─" * 24
+    divider = "─" * 28
     return (
         f"📌 POST #{num:04d}\n"
         f"📂 Type: {emoji} {ptype}\n"
+        f"👤 Posted by: {username_display}\n"
         f"{divider}\n\n"
         f"{content}\n\n"
         f"{divider}\n"
-        f"🚀 Promote FREE → {BOT_USERNAME}"
+        f"🚀 Promote FREE → {BOT_USERNAME}\n"
+        f"💡 Add hashtags for better search!"
     )
 
-def tpl_preview(ptype: str, content: str) -> str:
-    """Preview shown to user in DM — use HTML, escape user content."""
+def tpl_preview(ptype: str, content: str, username_display: str) -> str:
+    """Preview shown to user — use HTML, escape user content."""
     next_num = db["post_count"] + 1
-    emoji    = TYPE_EMOJI.get(ptype, "📋")
+    emoji = TYPE_EMOJI.get(ptype, "📋")
     return (
         f"👁 <b>Preview — POST #{next_num:04d}</b>\n"
         f"📂 Type: {emoji} {ptype}\n"
-        f"{'─'*24}\n\n"
+        f"👤 Posted by: {h(username_display)}\n"
+        f"{'─'*28}\n\n"
         f"{h(content)}\n\n"
-        f"{'─'*24}\n"
+        f"{'─'*28}\n"
         f"🚀 Promote FREE → {h(BOT_USERNAME)}\n\n"
         f"<i>Does this look good? Hit Publish or Edit.</i>"
+    )
+
+def tpl_send_content_prompt() -> str:
+    return (
+        "📝 <b>Submit Your Promotion</b>\n\n"
+        "Send your promotion message now.\n"
+        "Include your description and link.\n\n"
+        "<b>💡 Tips for better visibility:</b>\n"
+        "• Add up to <b>4 hashtags</b> for search &amp; ranking\n"
+        "• Example: #gaming #community #fun #telegram\n"
+        "• Write a clear description\n"
+        "• Include your invite link\n\n"
+        "<i>Send /cancel to abort.</i>"
     )
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -433,36 +621,39 @@ async def is_joined(uid: int, bot) -> bool:
 # PUBLISH
 # ═══════════════════════════════════════════════════════════════════════════════
 
-async def publish(uid: int, ptype: str, content: str, app: Application) -> int:
+async def do_publish(
+    uid: int, ptype: str, content: str,
+    username_display: str, app: Application
+) -> int:
     """
     Publish post to promotion channel.
-    Updates in-memory counters, saves to DB, logs audit record.
-    Raises TelegramError if sending fails (caller must handle and rollback).
+    Updates counters, saves DB, logs audit.
     """
     db["post_count"] += 1
-    num      = db["post_count"]
+    num = db["post_count"]
     stat_key = STAT_KEY.get(ptype.lower(), "others")
+    # Ensure key exists
+    if stat_key not in db:
+        db[stat_key] = 0
     db[stat_key] += 1
 
-    # Send WITHOUT parse_mode — user content may contain any characters
-    text = tpl_post(num, ptype, content)
+    text = tpl_post(num, ptype, content, username_display)
     try:
         await app.bot.send_message(
             chat_id=PROMO_CHANNEL_ID,
             text=text,
-            # No parse_mode — plain text, 100% safe with any user content
+            # No parse_mode — plain text, 100% safe
         )
     except TelegramError as e:
-        # Rollback counters before re-raising
+        # Rollback
         db["post_count"] -= 1
-        db[stat_key]     -= 1
+        db[stat_key] -= 1
         raise e
 
-    # Record rate-limit timestamp
     _rate[uid].append(time.time())
 
-    # Persist and audit (non-critical — don't raise on failure)
-    await db_log(app, num, uid, ptype)
+    uname = username_display.lstrip("@")
+    await db_log(app, num, uid, uname, ptype)
     await db_save(app)
     return num
 
@@ -471,7 +662,6 @@ async def publish(uid: int, ptype: str, content: str, app: Application) -> int:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 async def add_warning(uid: int, app: Application) -> int:
-    """Increment warning count. Auto-bans at MAX_WARNINGS. Returns new count."""
     count = get_warns(uid) + 1
     db["warnings"][str(uid)] = count
     if count >= MAX_WARNINGS and uid not in db["banned"]:
@@ -521,100 +711,125 @@ async def do_unban(uid: int, app: Application) -> None:
         pass
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# SAFE SEND WRAPPERS  — never crash on Telegram API errors
+# SAFE SEND WRAPPERS
 # ═══════════════════════════════════════════════════════════════════════════════
 
-async def send(update: Update, text: str, **kwargs) -> None:
+async def safe_reply(message, text: str, **kwargs) -> None:
     """Safe reply — logs but never raises."""
     try:
-        await update.message.reply_text(text, **kwargs)
+        await message.reply_text(text, **kwargs)
     except TelegramError as e:
-        log.warning(f"send() failed: {e}")
+        log.warning(f"safe_reply() failed: {e}")
 
-async def edit(query, text: str, **kwargs) -> None:
+async def safe_edit(query, text: str, **kwargs) -> None:
     """Safe edit — logs but never raises."""
     try:
         await query.edit_message_text(text, **kwargs)
+    except BadRequest as e:
+        if "message is not modified" not in str(e).lower():
+            log.warning(f"safe_edit() failed: {e}")
     except TelegramError as e:
-        log.warning(f"edit() failed: {e}")
+        log.warning(f"safe_edit() failed: {e}")
+
+async def safe_send(bot, chat_id: int, text: str, **kwargs) -> None:
+    """Send a message to a chat — silently skip on failure."""
+    try:
+        await bot.send_message(chat_id=chat_id, text=text, **kwargs)
+    except (Forbidden, BadRequest, TelegramError) as e:
+        log.debug(f"safe_send chat_id={chat_id} failed: {e}")
 
 async def notify(bot, uid: int, text: str, **kwargs) -> None:
-    """Send a DM to a user — silently skip if blocked/not started."""
-    try:
-        await bot.send_message(chat_id=uid, text=text, **kwargs)
-    except (Forbidden, BadRequest, TelegramError) as e:
-        log.debug(f"notify uid={uid} failed: {e}")
+    """Send a DM to a user — silently skip if blocked."""
+    await safe_send(bot, uid, text, **kwargs)
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # POST SUBMISSION FLOW HELPERS
 # ═══════════════════════════════════════════════════════════════════════════════
 
-async def begin_post(message, uid: int, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+async def begin_post(message, user, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Rate-limit check then start the submission session."""
+    uid = user.id
     ok, wait = rate_ok(uid)
     if not ok:
-        await message.reply_text(
+        await safe_reply(message,
             f"⏳ <b>Posting limit reached.</b>\n\n"
             f"You can post <b>{POSTS_PER_HOUR}</b> time(s) per hour.\n"
             f"Please wait <b>{fmt_wait(wait)}</b> and try again.",
             parse_mode="HTML",
         )
         return
-    _sessions[uid] = {"step": "wait_content"}
-    await message.reply_text(
-        "📝 <b>Submit Your Promotion</b>\n\n"
-        "Send your promotion message now.\n"
-        "Include your description and link.\n\n"
-        "<i>Send /cancel to abort.</i>",
-        parse_mode="HTML",
-    )
 
-async def process_content(update: Update, ctx: ContextTypes.DEFAULT_TYPE, text: str) -> None:
-    """Handle user's promotion content — validate, detect type, show preview or type picker."""
-    uid = update.effective_user.id
+    _sessions[uid] = {
+        "step": "wait_content",
+        "username": get_username_display(user),
+        "chat_type": message.chat.type,
+    }
+    await safe_reply(message, tpl_send_content_prompt(), parse_mode="HTML")
+
+
+async def process_content(
+    message, user, ctx: ContextTypes.DEFAULT_TYPE, text: str
+) -> None:
+    """Handle user's promotion content."""
+    uid = user.id
 
     if not text.strip():
-        await send(update, "⚠️ Empty message. Please send your promotion text:", parse_mode="HTML")
+        await safe_reply(message,
+            "⚠️ Empty message. Please send your promotion text:",
+            parse_mode="HTML")
         return
 
     if has_bad_content(text):
-        await issue_warning(update, ctx, uid)
+        await issue_warning_msg(message, ctx, uid)
         return
 
-    _sessions[uid]["content"] = text
+    # Check hashtag limit
+    htag_count = count_hashtags(text)
+    if htag_count > 4:
+        await safe_reply(message,
+            f"⚠️ <b>Too many hashtags!</b>\n\n"
+            f"You used <b>{htag_count}</b> hashtags. Maximum is <b>4</b>.\n"
+            f"Please resend with 4 or fewer hashtags.",
+            parse_mode="HTML")
+        return
+
+    session = _sessions.get(uid)
+    if not session:
+        return
+    session["content"] = text
 
     ptype = await detect_type(text, ctx.bot)
     if ptype:
-        _sessions[uid]["ptype"] = ptype
-        _sessions[uid]["step"]  = "confirm"
-        await update.message.reply_text(
-            tpl_preview(ptype, text),
+        session["ptype"] = ptype
+        session["step"] = "confirm"
+        username_display = session.get("username", get_username_display(user))
+        await safe_reply(message,
+            tpl_preview(ptype, text, username_display),
             parse_mode="HTML",
             reply_markup=kb_confirm(),
         )
     else:
-        _sessions[uid]["step"] = "wait_type"
-        await update.message.reply_text(
+        session["step"] = "wait_type"
+        await safe_reply(message,
             "📂 <b>Select your promotion type:</b>",
             parse_mode="HTML",
             reply_markup=kb_type(),
         )
 
-async def issue_warning(update: Update, ctx: ContextTypes.DEFAULT_TYPE, uid: int) -> None:
-    """Warn user for bad content. Auto-ban at MAX_WARNINGS."""
+
+async def issue_warning_msg(message, ctx: ContextTypes.DEFAULT_TYPE, uid: int) -> None:
+    """Warn user for bad content."""
     count = await add_warning(uid, ctx.application)
     if is_banned(uid):
         _sessions.pop(uid, None)
-        await send(
-            update,
+        await safe_reply(message,
             f"🚫 <b>Permanently banned</b> after {MAX_WARNINGS} violations.\n"
             f"Inappropriate content is not tolerated.",
             parse_mode="HTML",
         )
     else:
         left = MAX_WARNINGS - count
-        await send(
-            update,
+        await safe_reply(message,
             f"⚠️ <b>Warning {count}/{MAX_WARNINGS}:</b> Inappropriate content detected.\n"
             f"<b>{left}</b> warning(s) remaining before a permanent ban.\n\n"
             f"Please send appropriate content:",
@@ -629,57 +844,69 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     chat = update.effective_chat
 
-    # /start is DM only
+    if not user or not update.message:
+        return
+
     if chat.type != ChatType.PRIVATE:
         return
 
     if is_banned(user.id):
-        await send(update, "🚫 You are banned from PromoteHub.", parse_mode="HTML")
+        await safe_reply(update.message,
+            "🚫 You are banned from PromoteHub.", parse_mode="HTML")
         return
 
     # Deep-link: /start post
     if ctx.args and ctx.args[0] == "post":
+        if not post_allowed_here(ChatType.PRIVATE):
+            await safe_reply(update.message,
+                f"📩 Posting is only allowed in the group.\n"
+                f"Please use /post in: {GROUP_LINK or 'our group'}",
+                parse_mode="HTML")
+            return
         joined = await is_joined(user.id, ctx.bot)
         if not joined:
-            await send(update,
+            await safe_reply(update.message,
                 "⚠️ Please join our channel and group first:",
                 parse_mode="HTML", reply_markup=kb_join())
             return
-        await begin_post(update.message, user.id, ctx)
+        await begin_post(update.message, user, ctx)
         return
 
-    # Force-join check
     joined = await is_joined(user.id, ctx.bot)
     if not joined:
-        await send(update,
+        await safe_reply(update.message,
             "👋 <b>Welcome to PromoteHub!</b>\n\n"
             "Please join our channel and group first to use the bot:",
             parse_mode="HTML", reply_markup=kb_join())
         return
 
-    await update.message.reply_text(
+    await safe_reply(update.message,
         tpl_home(user.first_name),
         parse_mode="HTML",
         reply_markup=kb_home(),
     )
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# /post
+# /post — works in DM and group based on POST_ALLOWED_IN
 # ═══════════════════════════════════════════════════════════════════════════════
 
 async def cmd_post(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     chat = update.effective_chat
+    msg = update.message
 
-    if is_banned(user.id):
-        await send(update, "🚫 You are banned from PromoteHub.", parse_mode="HTML")
+    if not user or not msg:
         return
 
-    # Enforce POST_ALLOWED_IN setting
+    if is_banned(user.id):
+        await safe_reply(msg, "🚫 You are banned from PromoteHub.", parse_mode="HTML")
+        return
+
+    # Enforce POST_ALLOWED_IN
     if not post_allowed_here(chat.type):
         if POST_ALLOWED_IN == "dm":
             bot_name = BOT_USERNAME.lstrip("@")
-            await send(update,
+            await safe_reply(msg,
                 "📩 <b>Please submit promotions in private chat with the bot:</b>",
                 parse_mode="HTML",
                 reply_markup=InlineKeyboardMarkup([[
@@ -687,46 +914,68 @@ async def cmd_post(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
                         url=f"https://t.me/{bot_name}?start=post")
                 ]]))
         elif POST_ALLOWED_IN == "group":
-            await send(update,
-                f"📩 Please use /post inside our group: {GROUP_LINK}",
+            await safe_reply(msg,
+                f"📩 Please use /post inside our group: {GROUP_LINK or 'our group'}",
                 parse_mode="HTML")
         return
 
-    # Force-join check (only needed in DM — group members are already "in")
-    if chat.type == ChatType.PRIVATE:
-        joined = await is_joined(user.id, ctx.bot)
-        if not joined:
-            await send(update,
-                "⚠️ You must join our channel and group first:",
-                parse_mode="HTML", reply_markup=kb_join())
-            return
+    # Force-join check
+    joined = await is_joined(user.id, ctx.bot)
+    if not joined:
+        await safe_reply(msg,
+            "⚠️ You must join our channel and group first:",
+            parse_mode="HTML", reply_markup=kb_join())
+        return
 
-    await begin_post(update.message, user.id, ctx)
+    # Check if /post has inline content: /post <message>
+    raw_text = msg.text or ""
+    # Remove the /post command itself
+    inline_content = ""
+    match = re.match(r"^/post(?:@\w+)?\s+(.+)", raw_text, re.DOTALL)
+    if match:
+        inline_content = match.group(1).strip()
+
+    if inline_content:
+        # Direct content provided with /post command
+        _sessions[user.id] = {
+            "step": "wait_content",
+            "username": get_username_display(user),
+            "chat_type": chat.type,
+        }
+        await process_content(msg, user, ctx, inline_content)
+    else:
+        # No inline content — start interactive flow
+        await begin_post(msg, user, ctx)
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# /stats  /help  /cancel
+# /stats /help /cancel
 # ═══════════════════════════════════════════════════════════════════════════════
 
 async def cmd_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    await send(update, tpl_stats(), parse_mode="HTML")
+    if update.message:
+        await safe_reply(update.message, tpl_stats(), parse_mode="HTML")
 
 async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    await send(update, tpl_help(), parse_mode="HTML")
+    if update.message:
+        await safe_reply(update.message, tpl_help(), parse_mode="HTML")
 
 async def cmd_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.effective_user:
+        return
     uid = update.effective_user.id
     if uid in _sessions:
         del _sessions[uid]
-        await send(update, "❌ Cancelled. Use /post to start again.", parse_mode="HTML")
+        await safe_reply(update.message,
+            "❌ Cancelled. Use /post to start again.", parse_mode="HTML")
     else:
-        await send(update, "Nothing to cancel.", parse_mode="HTML")
+        await safe_reply(update.message, "Nothing to cancel.", parse_mode="HTML")
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# MESSAGE HANDLER  — DM submission flow + group moderation
+# MESSAGE HANDLER — DM/group submission flow + group moderation
 # ═══════════════════════════════════════════════════════════════════════════════
 
 async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    msg  = update.message
+    msg = update.message
     user = update.effective_user
     chat = update.effective_chat
 
@@ -734,28 +983,40 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     text = msg.text.strip()
+    uid = user.id
 
-    # ── Group moderation ──────────────────────────────────────────────
-    if chat.type in (ChatType.GROUP, ChatType.SUPERGROUP) and chat.id == GROUP_ID:
-        await moderate_group(update, ctx, text)
+    # ── Group messages ────────────────────────────────────────────────
+    if chat.type in (ChatType.GROUP, ChatType.SUPERGROUP):
+        # First check if user has an active session (group posting mode)
+        session = _sessions.get(uid)
+        if session and session.get("chat_type") in (ChatType.GROUP, ChatType.SUPERGROUP):
+            if session["step"] == "wait_content":
+                await process_content(msg, user, ctx, text)
+                return
+            # Other steps (wait_type, confirm) are handled by callbacks
+            # Don't fall through to moderation for session users
+
+        # Group moderation for non-session messages
+        if chat.id == GROUP_ID:
+            await moderate_group(update, ctx, text)
         return
 
     # ── DM only below ─────────────────────────────────────────────────
     if chat.type != ChatType.PRIVATE:
         return
 
-    if is_banned(user.id):
-        await send(update, "🚫 You are banned from PromoteHub.", parse_mode="HTML")
+    if is_banned(uid):
+        await safe_reply(msg, "🚫 You are banned from PromoteHub.", parse_mode="HTML")
         return
 
-    session = _sessions.get(user.id)
+    session = _sessions.get(uid)
     if not session:
-        await send(update, "💡 Use /post to submit a promotion.", parse_mode="HTML")
+        await safe_reply(msg, "💡 Use /post to submit a promotion.", parse_mode="HTML")
         return
 
     if session["step"] == "wait_content":
-        await process_content(update, ctx, text)
-    # wait_type step is handled entirely by inline button callbacks
+        await process_content(msg, user, ctx, text)
+    # wait_type and confirm steps are handled by callback buttons
 
 
 async def moderate_group(
@@ -764,11 +1025,9 @@ async def moderate_group(
     """Delete bad messages from the group and warn/ban the sender."""
     uid = update.effective_user.id
 
-    # Admins are immune
     if is_admin(uid):
         return
 
-    # Silently delete messages from already-banned users
     if is_banned(uid):
         try:
             await update.message.delete()
@@ -817,11 +1076,13 @@ async def moderate_group(
 # ═══════════════════════════════════════════════════════════════════════════════
 
 async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    q   = update.callback_query
-    uid = q.from_user.id
-    d   = q.data
+    q = update.callback_query
+    if not q or not q.from_user:
+        return
 
-    # Always answer the callback — prevents "loading" spinner in Telegram
+    uid = q.from_user.id
+    d = q.data or ""
+
     try:
         await q.answer()
     except TelegramError:
@@ -831,64 +1092,79 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if d == "check_join":
         joined = await is_joined(uid, ctx.bot)
         if joined:
-            await edit(q,
+            await safe_edit(q,
                 f"✅ <b>Verified!</b> You're all set.\n\n"
                 f"📊 <b>{db['post_count']}</b> promotions published!",
                 parse_mode="HTML", reply_markup=kb_home())
         else:
-            await edit(q,
+            await safe_edit(q,
                 "❌ You haven't joined yet.\n\nPlease join <b>both</b> and try again:",
                 parse_mode="HTML", reply_markup=kb_join())
 
     # ── Home ─────────────────────────────────────────────────────────
     elif d == "home":
-        await edit(q,
+        _sessions.pop(uid, None)
+        await safe_edit(q,
             f"🏠 <b>PromoteHub</b> — {db['post_count']} promotions published!",
             parse_mode="HTML", reply_markup=kb_home())
 
     # ── Stats ─────────────────────────────────────────────────────────
     elif d == "stats":
-        await edit(q, tpl_stats(), parse_mode="HTML", reply_markup=kb_back())
+        await safe_edit(q, tpl_stats(), parse_mode="HTML", reply_markup=kb_back())
 
     # ── Help ──────────────────────────────────────────────────────────
     elif d == "help":
-        await edit(q, tpl_help(), parse_mode="HTML", reply_markup=kb_back())
+        await safe_edit(q, tpl_help(), parse_mode="HTML", reply_markup=kb_back())
 
     # ── Start post (from home menu button) ────────────────────────────
     elif d == "start_post":
         if is_banned(uid):
-            await edit(q, "🚫 You are banned from PromoteHub.", parse_mode="HTML")
+            await safe_edit(q, "🚫 You are banned from PromoteHub.", parse_mode="HTML")
             return
+
+        # Check if posting is allowed in DM (callback comes from DM always for inline buttons)
+        if not post_allowed_here(ChatType.PRIVATE):
+            await safe_edit(q,
+                f"📩 Posting is only allowed in the group.\n"
+                f"Please use /post in: {GROUP_LINK or 'our group'}",
+                parse_mode="HTML")
+            return
+
         ok, wait = rate_ok(uid)
         if not ok:
-            await edit(q,
+            await safe_edit(q,
                 f"⏳ <b>Posting limit reached.</b>\n\n"
                 f"Please wait <b>{fmt_wait(wait)}</b> and try again.",
                 parse_mode="HTML")
             return
-        _sessions[uid] = {"step": "wait_content"}
-        await edit(q,
-            "📝 <b>Submit Your Promotion</b>\n\n"
-            "Send your promotion message now.\n"
-            "Include your description and link.\n\n"
-            "<i>Send /cancel to abort.</i>",
-            parse_mode="HTML")
 
-    # ── Type selection (after user sends content) ─────────────────────
+        _sessions[uid] = {
+            "step": "wait_content",
+            "username": get_username_display(q.from_user),
+            "chat_type": ChatType.PRIVATE,
+        }
+        await safe_edit(q, tpl_send_content_prompt(), parse_mode="HTML")
+
+    # ── Type selection ────────────────────────────────────────────────
     elif d.startswith("type:"):
         session = _sessions.get(uid)
         if not session:
-            await edit(q, "⚠️ Session expired. Please use /post to start again.", parse_mode="HTML")
+            await safe_edit(q,
+                "⚠️ Session expired. Please use /post to start again.",
+                parse_mode="HTML")
             return
         ptype = d[5:]
         if ptype not in TYPE_EMOJI:
-            await edit(q, "⚠️ Unknown type. Please use /post to start again.", parse_mode="HTML")
+            await safe_edit(q,
+                "⚠️ Unknown type. Please use /post to start again.",
+                parse_mode="HTML")
             return
         session["ptype"] = ptype
-        session["step"]  = "confirm"
+        session["step"] = "confirm"
         content = session.get("content", "")
-        await edit(q,
-            tpl_preview(ptype, content),
+        username_display = session.get("username", get_username_display(q.from_user))
+        await safe_edit(q,
+            tpl_preview(ptype, content, username_display),
             parse_mode="HTML",
             reply_markup=kb_confirm())
 
@@ -896,50 +1172,68 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     elif d == "publish":
         session = _sessions.get(uid)
         if not session or session.get("step") != "confirm":
-            await edit(q, "⚠️ Session expired. Please use /post to start again.", parse_mode="HTML")
+            await safe_edit(q,
+                "⚠️ Session expired. Please use /post to start again.",
+                parse_mode="HTML")
             return
 
-        # Show immediate feedback
-        await edit(q, "⏳ Publishing your post...", parse_mode="HTML")
+        await safe_edit(q, "⏳ Publishing your post...", parse_mode="HTML")
+
+        ptype = session.get("ptype", "Other")
+        content = session.get("content", "")
+        username_display = session.get("username", get_username_display(q.from_user))
 
         try:
-            num = await publish(uid, session["ptype"], session["content"], ctx.application)
+            num = await do_publish(
+                uid, ptype, content, username_display, ctx.application
+            )
             _sessions.pop(uid, None)
-            emoji = TYPE_EMOJI.get(session["ptype"], "📋")
-            await edit(q,
+            emoji = TYPE_EMOJI.get(ptype, "📋")
+            await safe_edit(q,
                 f"✅ <b>Post Published!</b>\n\n"
                 f"📌 <b>POST #{num:04d}</b> is now live!\n"
-                f"📂 Type: {emoji} {h(session['ptype'])}\n\n"
+                f"📂 Type: {emoji} {h(ptype)}\n"
+                f"👤 Posted by: {h(username_display)}\n\n"
                 f"🎉 Share the bot to help others promote too!\n"
                 f"{h(BOT_USERNAME)}",
                 parse_mode="HTML",
                 reply_markup=kb_after_post())
         except TelegramError as e:
             log.error(f"Publish failed for uid={uid}: {e}")
-            await edit(q,
+            _sessions.pop(uid, None)
+            await safe_edit(q,
                 "❌ <b>Failed to publish.</b>\n\n"
                 "Please try again with /post.",
                 parse_mode="HTML")
 
-    # ── Edit (go back to resend content) ─────────────────────────────
+    # ── Edit ─────────────────────────────────────────────────────
     elif d == "edit":
-        if uid in _sessions:
-            _sessions[uid]["step"] = "wait_content"
+        session = _sessions.get(uid)
+        if session:
+            session["step"] = "wait_content"
         else:
-            _sessions[uid] = {"step": "wait_content"}
-        await edit(q, "✏️ Send your updated promotion message:", parse_mode="HTML")
+            _sessions[uid] = {
+                "step": "wait_content",
+                "username": get_username_display(q.from_user),
+                "chat_type": ChatType.PRIVATE,
+            }
+        await safe_edit(q,
+            "✏️ Send your updated promotion message:\n\n"
+            "<b>💡 Remember:</b> Add up to 4 hashtags for better visibility!",
+            parse_mode="HTML")
 
     # ── Cancel ────────────────────────────────────────────────────────
     elif d == "cancel":
         _sessions.pop(uid, None)
-        await edit(q, "❌ Cancelled. Use /post to start again.", parse_mode="HTML")
+        await safe_edit(q,
+            "❌ Cancelled. Use /post to start again.",
+            parse_mode="HTML")
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # ADMIN COMMANDS
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _get_target(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Optional[int]:
-    """Extract target user ID from command args or replied-to message."""
     if ctx.args:
         try:
             return int(ctx.args[0])
@@ -951,13 +1245,16 @@ def _get_target(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Optional[int]
     return None
 
 async def cmd_admin(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.effective_user:
+        return
     if not is_admin(update.effective_user.id):
         return
-    await send(update,
+    await safe_reply(update.message,
         f"🔧 <b>Admin Panel</b>\n\n"
         f"📌 Posts   : {db['post_count']}\n"
-        f"🚫 Banned  : {len(db['banned'])}\n"
-        f"⚠️ Warned  : {len(db['warnings'])}\n\n"
+        f"🚫 Banned  : {len(db.get('banned', []))}\n"
+        f"⚠️ Warned  : {len(db.get('warnings', {}))}\n"
+        f"📩 Post Mode: {POST_ALLOWED_IN}\n\n"
         f"<code>/ban &lt;id&gt;</code>          Ban a user\n"
         f"<code>/unban &lt;id&gt;</code>        Unban a user\n"
         f"<code>/warn &lt;id&gt;</code>         Add a warning\n"
@@ -966,115 +1263,150 @@ async def cmd_admin(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         parse_mode="HTML")
 
 async def cmd_ban(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.effective_user:
+        return
     if not is_admin(update.effective_user.id):
         return
     uid = _get_target(update, ctx)
     if not uid:
-        await send(update, "Usage: /ban &lt;user_id&gt;  or reply to a message.", parse_mode="HTML")
+        await safe_reply(update.message,
+            "Usage: /ban &lt;user_id&gt; or reply to a message.",
+            parse_mode="HTML")
         return
     if uid in ADMIN_IDS:
-        await send(update, "❌ Cannot ban an admin.", parse_mode="HTML")
+        await safe_reply(update.message, "❌ Cannot ban an admin.", parse_mode="HTML")
         return
     await do_ban(uid, ctx.application)
-    await send(update, f"✅ User <code>{uid}</code> banned.", parse_mode="HTML")
-    await notify(ctx.bot, uid, "🚫 You have been banned from PromoteHub by an admin.")
+    _sessions.pop(uid, None)
+    await safe_reply(update.message,
+        f"✅ User <code>{uid}</code> banned.", parse_mode="HTML")
+    await notify(ctx.bot, uid,
+        "🚫 You have been banned from PromoteHub by an admin.")
 
 async def cmd_unban(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.effective_user:
+        return
     if not is_admin(update.effective_user.id):
         return
     uid = _get_target(update, ctx)
     if not uid:
-        await send(update, "Usage: /unban &lt;user_id&gt;", parse_mode="HTML")
+        await safe_reply(update.message,
+            "Usage: /unban &lt;user_id&gt;", parse_mode="HTML")
         return
     await do_unban(uid, ctx.application)
-    await send(update, f"✅ User <code>{uid}</code> unbanned.", parse_mode="HTML")
-    await notify(ctx.bot, uid, "✅ You have been unbanned from PromoteHub. Use /start to continue.")
+    await safe_reply(update.message,
+        f"✅ User <code>{uid}</code> unbanned.", parse_mode="HTML")
+    await notify(ctx.bot, uid,
+        "✅ You have been unbanned from PromoteHub. Use /start to continue.")
 
 async def cmd_warn_admin(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.effective_user:
+        return
     if not is_admin(update.effective_user.id):
         return
     uid = _get_target(update, ctx)
     if not uid:
-        await send(update, "Usage: /warn &lt;user_id&gt;", parse_mode="HTML")
+        await safe_reply(update.message,
+            "Usage: /warn &lt;user_id&gt;", parse_mode="HTML")
         return
     count = await add_warning(uid, ctx.application)
     if is_banned(uid):
-        await send(update, f"⛔ User <code>{uid}</code> auto-banned (reached {MAX_WARNINGS} warnings).", parse_mode="HTML")
+        _sessions.pop(uid, None)
+        await safe_reply(update.message,
+            f"⛔ User <code>{uid}</code> auto-banned "
+            f"(reached {MAX_WARNINGS} warnings).",
+            parse_mode="HTML")
     else:
-        await send(update, f"⚠️ User <code>{uid}</code> warned ({count}/{MAX_WARNINGS}).", parse_mode="HTML")
+        await safe_reply(update.message,
+            f"⚠️ User <code>{uid}</code> warned ({count}/{MAX_WARNINGS}).",
+            parse_mode="HTML")
 
 async def cmd_broadcast(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.effective_user:
+        return
     if not is_admin(update.effective_user.id):
         return
     if not ctx.args:
-        await send(update, "Usage: /broadcast &lt;message&gt;", parse_mode="HTML")
+        await safe_reply(update.message,
+            "Usage: /broadcast &lt;message&gt;", parse_mode="HTML")
         return
-    msg = " ".join(ctx.args)
+    msg_text = " ".join(ctx.args)
     try:
         await ctx.bot.send_message(
             chat_id=PROMO_CHANNEL_ID,
-            text=f"📢 Announcement\n\n{msg}",
-            # No parse_mode — admin message may contain any characters
+            text=f"📢 Announcement\n\n{msg_text}",
         )
-        await send(update, "✅ Broadcast sent to channel.", parse_mode="HTML")
+        await safe_reply(update.message,
+            "✅ Broadcast sent to channel.", parse_mode="HTML")
     except TelegramError as e:
-        await send(update, f"❌ Failed: {h(str(e))}", parse_mode="HTML")
+        await safe_reply(update.message,
+            f"❌ Failed: {h(str(e))}", parse_mode="HTML")
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# GLOBAL ERROR HANDLER  — catches ALL unhandled exceptions, logs them, never crashes
+# GLOBAL ERROR HANDLER
 # ═══════════════════════════════════════════════════════════════════════════════
 
 async def error_handler(update: object, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    # Ignore network timeouts — they're normal
+    if isinstance(ctx.error, (NetworkError, TimedOut)):
+        log.warning(f"Network error (will retry): {ctx.error}")
+        return
+
     log.error(f"Unhandled exception: {ctx.error}", exc_info=ctx.error)
-    # If we have a message context, tell the user something went wrong
+
     if isinstance(update, Update):
-        if update.message:
-            try:
-                await update.message.reply_text(
-                    "⚠️ Something went wrong. Please try again or use /cancel.",
-                    parse_mode="HTML",
-                )
-            except TelegramError:
-                pass
-        elif update.callback_query:
-            try:
+        try:
+            if update.callback_query:
                 await update.callback_query.answer(
                     "⚠️ Something went wrong. Please try again.",
                     show_alert=True,
                 )
-            except TelegramError:
-                pass
+            elif update.message:
+                await update.message.reply_text(
+                    "⚠️ Something went wrong. Please try again or use /cancel.",
+                    parse_mode="HTML",
+                )
+        except TelegramError:
+            pass
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# STARTUP  — load DB, set commands
+# STARTUP — load DB, set commands
 # ═══════════════════════════════════════════════════════════════════════════════
 
 async def on_startup(app: Application) -> None:
     log.info("PromoteHub starting up…")
     await db_load(app)
-    await app.bot.set_my_commands([
-        BotCommand("start",     "Home menu"),
-        BotCommand("post",      "Submit a free promotion"),
-        BotCommand("stats",     "Live statistics"),
-        BotCommand("help",      "Help & rules"),
-        BotCommand("cancel",    "Cancel current action"),
-    ])
+
+    try:
+        await app.bot.set_my_commands([
+            BotCommand("start", "Home menu"),
+            BotCommand("post", "Submit a free promotion"),
+            BotCommand("stats", "Live statistics"),
+            BotCommand("help", "Help & rules"),
+            BotCommand("cancel", "Cancel current action"),
+        ])
+    except TelegramError as e:
+        log.warning(f"Failed to set commands: {e}")
+
     log.info(
         f"✅ PromoteHub ready! "
         f"posts={db['post_count']} "
-        f"POST_ALLOWED_IN={POST_ALLOWED_IN}"
+        f"POST_ALLOWED_IN={POST_ALLOWED_IN} "
+        f"mode={'webhook' if WEBHOOK_URL else 'polling'}"
     )
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# KEEP-ALIVE HTTP SERVER  — UptimeRobot pings this to prevent Render sleep
+# KEEP-ALIVE HTTP SERVER — for Render health checks + UptimeRobot
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class _HealthHandler(BaseHTTPRequestHandler):
-    def do_GET(self):  # noqa: N802
+    def do_GET(self):
         body = (
             f"PromoteHub OK\n"
             f"posts={db['post_count']}\n"
-            f"banned={len(db['banned'])}\n"
+            f"banned={len(db.get('banned', []))}\n"
+            f"mode={'webhook' if WEBHOOK_URL else 'polling'}\n"
+            f"uptime=alive\n"
         ).encode()
         self.send_response(200)
         self.send_header("Content-Type", "text/plain")
@@ -1082,8 +1414,12 @@ class _HealthHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def do_HEAD(self):
+        self.send_response(200)
+        self.end_headers()
+
     def log_message(self, *_):
-        pass  # suppress HTTP log noise
+        pass
 
 
 def start_http_server() -> None:
@@ -1097,66 +1433,9 @@ def start_http_server() -> None:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def build_app() -> Application:
-    app = (
-        Application.builder()
-        .token(BOT_TOKEN)
-        .post_init(on_startup)
-        .build()
-    )
+    builder = Application.builder().token(BOT_TOKEN).post_init(on_startup)
 
-    # User commands
-    app.add_handler(CommandHandler("start",     cmd_start))
-    app.add_handler(CommandHandler("post",      cmd_post))
-    app.add_handler(CommandHandler("stats",     cmd_stats))
-    app.add_handler(CommandHandler("help",      cmd_help))
-    app.add_handler(CommandHandler("cancel",    cmd_cancel))
-
-    # Admin commands
-    app.add_handler(CommandHandler("admin",     cmd_admin))
-    app.add_handler(CommandHandler("ban",       cmd_ban))
-    app.add_handler(CommandHandler("unban",     cmd_unban))
-    app.add_handler(CommandHandler("warn",      cmd_warn_admin))
-    app.add_handler(CommandHandler("broadcast", cmd_broadcast))
-
-    # Callbacks & messages
-    app.add_handler(CallbackQueryHandler(on_callback))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
-
-    # Global error handler — catches everything that slips through
-    app.add_error_handler(error_handler)
-
-    return app
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# MAIN  — asyncio.run compatible with Python 3.10–3.14
-# ═══════════════════════════════════════════════════════════════════════════════
-
-async def main() -> None:
-    start_http_server()
-    app = build_app()
-
-    async with app:
-        await app.start()
-        await app.updater.start_polling(
-            allowed_updates=Update.ALL_TYPES,
-            drop_pending_updates=True,
-        )
-        log.info("Bot is live and polling.")
-
-        # Wait for shutdown signal
-        stop = asyncio.Event()
-        loop = asyncio.get_running_loop()
-        for sig in (signal.SIGINT, signal.SIGTERM):
-            try:
-                loop.add_signal_handler(sig, stop.set)
-            except (ValueError, NotImplementedError):
-                pass  # Windows doesn't support add_signal_handler
-
-        await stop.wait()
-        log.info("Shutdown signal received — stopping gracefully.")
-        await app.updater.stop()
-        await app.stop()
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
+    # Connection pool settings for stability
+    builder.connect_timeout(30.0)
+    builder.read_timeout(30.0)
+    builder.write_timeout(30.0)
