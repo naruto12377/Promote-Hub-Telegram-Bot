@@ -89,7 +89,7 @@ GROUP_ID           = int(_req("GROUP_ID"))
 GROUP_LINK         = os.getenv("GROUP_LINK", "").strip()
 DB_CHANNEL_ID      = int(_req("DATABASE_CHANNEL_ID"))
 ADMIN_IDS          = _intlist("ADMIN_IDS")
-PORT               = int(os.getenv("PORT", "8080"))
+PORT               = int(os.getenv("PORT", "10000"))   # Render default is 10000
 
 # Webhook URL for Render — e.g. https://myapp.onrender.com
 # Leave blank to fall back to long-polling (local dev)
@@ -1485,51 +1485,72 @@ async def main() -> None:
     global _app
     _app = build_app()
 
-    async with _app:
-        await _app.start()
+    if WEBHOOK_URL:
+        # ══════════════════════════════════════════════════════════════════════
+        # WEBHOOK MODE  — Render / any public HTTPS host
+        #
+        # CRITICAL ORDER:
+        #   1. Bind HTTP port FIRST  ← Render scans for an open port immediately
+        #   2. Then initialise Telegram (db_load, set_webhook, etc.)
+        #
+        # If we call Telegram API before the port is open, Render times out
+        # ("No open ports detected") and kills the process.
+        # ══════════════════════════════════════════════════════════════════════
 
-        if WEBHOOK_URL:
-            # ── Webhook mode (Render / any public HTTPS host) ─────────────────
+        # ── Step 1: open the port immediately ────────────────────────────────
+        web_application = make_web_app()
+        runner = web.AppRunner(web_application)
+        await runner.setup()
+        site = web.TCPSite(runner, "0.0.0.0", PORT)
+        await site.start()
+        log.info(f"✅ HTTP server bound to port {PORT}  ← Render will detect this")
+
+        # ── Step 2: initialise the Telegram application ───────────────────────
+        async with _app:
+            await _app.start()   # triggers on_startup → db_load, set_my_commands
+
             webhook_full_url = f"{WEBHOOK_URL.rstrip('/')}/{BOT_TOKEN}"
             await _app.bot.set_webhook(
                 url=webhook_full_url,
                 allowed_updates=Update.ALL_TYPES,
                 drop_pending_updates=True,
             )
-            log.info(f"Webhook set: {webhook_full_url}")
+            log.info(f"✅ Webhook registered: {webhook_full_url}")
 
-            # Start aiohttp server (handles webhook + health check on PORT)
-            web_application = make_web_app()
-            runner = web.AppRunner(web_application)
-            await runner.setup()
-            site = web.TCPSite(runner, "0.0.0.0", PORT)
-            await site.start()
-            log.info(f"HTTP server listening on port {PORT}")
-
-            # Run until interrupted
+            # ── Run until interrupted ─────────────────────────────────────────
             try:
                 await asyncio.Event().wait()
             except (KeyboardInterrupt, SystemExit):
-                pass
+                log.info("Shutdown signal received.")
             finally:
-                await runner.cleanup()
-                await _app.bot.delete_webhook()
-        else:
-            # ── Polling mode (local dev — no WEBHOOK_URL set) ─────────────────
-            log.info("No WEBHOOK_URL set — falling back to long-polling (dev mode).")
+                log.info("Shutting down…")
+                try:
+                    await _app.bot.delete_webhook()
+                except TelegramError:
+                    pass
+                await _app.stop()
+
+        await runner.cleanup()
+
+    else:
+        # ══════════════════════════════════════════════════════════════════════
+        # POLLING MODE  — local development (no WEBHOOK_URL set)
+        # ══════════════════════════════════════════════════════════════════════
+        log.info("No WEBHOOK_URL set — using long-polling (dev mode).")
+        async with _app:
+            await _app.start()
             await _app.updater.start_polling(
                 allowed_updates=Update.ALL_TYPES,
                 drop_pending_updates=True,
             )
-            log.info("Bot polling. Press Ctrl+C to stop.")
+            log.info("Bot is polling. Press Ctrl+C to stop.")
             try:
                 await asyncio.Event().wait()
             except (KeyboardInterrupt, SystemExit):
                 pass
             finally:
                 await _app.updater.stop()
-
-        await _app.stop()
+                await _app.stop()
 
 
 if __name__ == "__main__":
